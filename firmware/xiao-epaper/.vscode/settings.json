@@ -1,0 +1,7 @@
+{
+  "clangd.arguments": [
+    "--compile-commands-dir=/Users/samwalker/Projects/vision-menu-270730/firmware/xiao-epaper/.cache/clangd",
+    "--query-driver=/Users/samwalker/.platformio/packages/toolchain-*/bin/*,/Users/samwalker/.platformio/packages/tool-*/bin/*"
+  ],
+  "idf.currentSetup": "/Users/samwalker/.espressif/v6.0/esp-idf"
+}

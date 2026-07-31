@@ -17,6 +17,7 @@ Grove Vision AI V2  --I2C/SSCMA-->  XIAO ESP32-C3  --HTTP POST-->  Next.js /api/
 | `apps/web` | Next.js panel (dashboard + still-unlocked menu) |
 | `packages/shared` | Shared Zod schemas / types |
 | `firmware/xiao-vision` | PlatformIO firmware for ESP32-C3 |
+| `firmware/xiao-epaper` | EE04 + 5.83" ePaper hardware smoke-test demo |
 
 ## Quick start (web)
 
