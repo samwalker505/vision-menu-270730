@@ -3,15 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import {
+  DEFAULT_OFFER_STATE,
   DEFAULT_PANEL_STATE,
+  OFFER_DISPLAY_MS,
   PLACEHOLDER_MENU,
   type DetectionBox,
+  type OfferState,
   type PanelState,
 } from "@repo/shared";
-
-const OFFER_PRESENT_MS = 5000;
-
-type OfferPhase = "idle" | "prompt" | "qr" | "dismissed";
 
 function formatConfidence(value: number): string {
   return `${Math.round(value * 100)}%`;
@@ -51,30 +50,20 @@ function wsUrl(): string {
   return `${proto}//${host}:${port}/`;
 }
 
-function pickDiscountPct(): number {
-  return 10 + Math.floor(Math.random() * 11);
-}
-
 export function VisionPanel() {
   const [state, setState] = useState<PanelState>(DEFAULT_PANEL_STATE);
+  const [offer, setOffer] = useState<OfferState>(DEFAULT_OFFER_STATE);
   const [now, setNow] = useState(() => Date.now());
   const [connected, setConnected] = useState(false);
   const [displayBox, setDisplayBox] = useState<BoxRect | null>(null);
   const [imageSrc, setImageSrc] = useState<string | null>(null);
-
-  const [offerPhase, setOfferPhase] = useState<OfferPhase>("idle");
-  const [presentSince, setPresentSince] = useState<number | null>(null);
-  const [discountPct, setDiscountPct] = useState<number | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [claiming, setClaiming] = useState(false);
 
   const targetBoxRef = useRef<BoxRect | null>(null);
   const displayBoxRef = useRef<BoxRect | null>(null);
   const objectUrlRef = useRef<string | null>(null);
-  const offerPhaseRef = useRef<OfferPhase>("idle");
-
-  useEffect(() => {
-    offerPhaseRef.current = offerPhase;
-  }, [offerPhase]);
+  const socketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -111,6 +100,7 @@ export function VisionPanel() {
       if (cancelled) return;
       const url = wsUrl();
       socket = new WebSocket(url);
+      socketRef.current = socket;
       socket.binaryType = "arraybuffer";
 
       socket.onopen = () => {
@@ -127,9 +117,13 @@ export function VisionPanel() {
             const msg = JSON.parse(event.data) as {
               type?: string;
               state?: PanelState;
+              offer?: OfferState;
             };
             if (msg.type === "state" && msg.state) {
               applyState(msg.state);
+            } else if (msg.type === "offer" && msg.offer) {
+              setOffer(msg.offer);
+              setClaiming(false);
             }
           } catch {
             // ignore
@@ -144,6 +138,7 @@ export function VisionPanel() {
       socket.onclose = () => {
         if (cancelled) return;
         setConnected(false);
+        socketRef.current = null;
         const delay = Math.min(4000, 500 * 2 ** attempt);
         attempt += 1;
         reconnectTimer = setTimeout(connect, delay);
@@ -162,6 +157,7 @@ export function VisionPanel() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       clearInterval(clock);
       socket?.close();
+      socketRef.current = null;
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
         objectUrlRef.current = null;
@@ -188,49 +184,51 @@ export function VisionPanel() {
     return () => cancelAnimationFrame(frame);
   }, []);
 
-  // Track continuous face presence for the guest offer.
+  // Render QR when the server activates a promo.
   useEffect(() => {
-    if (state.humanPresent) {
-      setPresentSince((prev) => prev ?? Date.now());
+    if (offer.phase !== "active" || !offer.code) {
+      setQrDataUrl(null);
       return;
     }
-    setPresentSince(null);
-    setOfferPhase("idle");
-    setDiscountPct(null);
-    setQrDataUrl(null);
-  }, [state.humanPresent]);
-
-  useEffect(() => {
-    if (!state.humanPresent || presentSince === null) return;
-    if (offerPhaseRef.current !== "idle") return;
-    if (now - presentSince < OFFER_PRESENT_MS) return;
-    setOfferPhase("prompt");
-  }, [state.humanPresent, presentSince, now]);
-
-  const acceptOffer = async () => {
-    const pct = pickDiscountPct();
-    const code = `VISION-${pct}OFF`;
-    try {
-      const url = await QRCode.toDataURL(code, {
-        width: 220,
-        margin: 2,
-        color: { dark: "#10241e", light: "#ffffff" },
+    let cancelled = false;
+    void QRCode.toDataURL(offer.code, {
+      width: 220,
+      margin: 2,
+      color: { dark: "#10241e", light: "#ffffff" },
+    })
+      .then((url) => {
+        if (!cancelled) setQrDataUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setQrDataUrl(null);
       });
-      setDiscountPct(pct);
-      setQrDataUrl(url);
-      setOfferPhase("qr");
-    } catch {
-      setDiscountPct(pct);
-      setQrDataUrl(null);
-      setOfferPhase("qr");
-    }
+    return () => {
+      cancelled = true;
+    };
+  }, [offer.phase, offer.code]);
+
+  const acceptOffer = () => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    setClaiming(true);
+    socket.send(JSON.stringify({ type: "claim_offer" }));
   };
 
   const dismissOffer = () => {
-    setOfferPhase("dismissed");
-    setDiscountPct(null);
-    setQrDataUrl(null);
+    const socket = socketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "dismiss_offer" }));
+    }
+    // Optimistic UI while the server ack arrives.
+    if (offer.phase === "prompt") {
+      setOffer((prev) => ({ ...prev, phase: "idle", updatedAt: Date.now() }));
+    }
   };
+
+  const remainingSec =
+    offer.phase === "active" && offer.expiresAt
+      ? Math.max(0, Math.ceil((offer.expiresAt - now) / 1000))
+      : 0;
 
   return (
     <div className="relative z-10 mx-auto flex min-h-screen w-full max-w-6xl flex-col gap-10 px-5 py-10 sm:px-8 lg:px-10">
@@ -249,7 +247,8 @@ export function VisionPanel() {
         </h1>
         <p className="max-w-xl text-base sm:text-lg" style={{ color: "var(--ink-soft)" }}>
           Today&apos;s menu is always on. Linger in frame for a few seconds and we may
-          offer a guest discount.
+          offer a guest discount — accepted codes also appear on the counter ePaper for{" "}
+          {OFFER_DISPLAY_MS / 1000}s.
         </p>
         <div className="flex items-center gap-3 text-sm" style={{ color: "var(--ink-soft)" }}>
           <span
@@ -363,6 +362,17 @@ export function VisionPanel() {
               active={state.isStill}
             />
             <StatusRow
+              label="Guest offer"
+              value={
+                offer.phase === "active" && offer.code
+                  ? `${offer.code} · ${remainingSec}s on ePaper`
+                  : offer.phase === "prompt"
+                    ? "Ready to claim"
+                    : "Waiting for guest"
+              }
+              active={offer.phase !== "idle"}
+            />
+            <StatusRow
               label="Confidence"
               value={state.humanPresent ? formatConfidence(state.confidence) : "—"}
               active={state.confidence >= 0.5}
@@ -371,7 +381,7 @@ export function VisionPanel() {
         </section>
       </div>
 
-      {offerPhase === "prompt" ? (
+      {offer.phase === "prompt" ? (
         <div
           className="animate-fade-up fixed inset-x-0 top-0 z-50 px-4 pt-4 sm:px-6"
           role="status"
@@ -393,17 +403,19 @@ export function VisionPanel() {
                 Guest offer ready
               </p>
               <p className="mt-0.5 text-sm" style={{ color: "var(--ink-soft)" }}>
-                You&apos;ve been here a moment — claim a 10–20% off code?
+                You&apos;ve been here a moment — claim a 10–20% off code? It will also
+                show on the counter ePaper for one minute.
               </p>
             </div>
             <div className="flex shrink-0 flex-wrap gap-3">
               <button
                 type="button"
-                onClick={() => void acceptOffer()}
-                className="px-5 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                onClick={acceptOffer}
+                disabled={claiming}
+                className="px-5 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-60"
                 style={{ background: "var(--accent)" }}
               >
-                Show my offer
+                {claiming ? "Sending…" : "Show my offer"}
               </button>
               <button
                 type="button"
@@ -418,7 +430,7 @@ export function VisionPanel() {
         </div>
       ) : null}
 
-      {offerPhase === "qr" && discountPct !== null ? (
+      {offer.phase === "active" && offer.discountPct !== null && offer.code ? (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center px-5"
           role="dialog"
@@ -444,19 +456,22 @@ export function VisionPanel() {
               className="text-3xl tracking-tight"
               style={{ fontFamily: "var(--font-display)", color: "var(--accent)" }}
             >
-              {discountPct}% off
+              {offer.discountPct}% off
             </p>
             <p className="mt-2 text-sm" style={{ color: "var(--ink-soft)" }}>
               Scan at the counter — code{" "}
               <span className="font-mono font-medium" style={{ color: "var(--ink)" }}>
-                VISION-{discountPct}OFF
+                {offer.code}
               </span>
+            </p>
+            <p className="mt-1 text-xs" style={{ color: "var(--ink-soft)" }}>
+              Also on ePaper · {remainingSec}s remaining
             </p>
             {qrDataUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={qrDataUrl}
-                alt={`QR code for VISION-${discountPct}OFF`}
+                alt={`QR code for ${offer.code}`}
                 className="mx-auto mt-6 h-52 w-52 bg-white p-2"
               />
             ) : (

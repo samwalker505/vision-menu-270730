@@ -95,3 +95,56 @@ export const PLACEHOLDER_MENU = [
 ] as const;
 
 export type MenuItem = (typeof PLACEHOLDER_MENU)[number];
+
+/** How long an accepted promo stays on the ePaper before welcome. */
+export const OFFER_DISPLAY_MS = 60_000;
+
+/** Continuous human presence required before the panel may prompt. */
+export const OFFER_ELIGIBLE_MS = 5_000;
+
+export const OfferStateSchema = z.object({
+  phase: z.enum(["idle", "prompt", "active"]),
+  discountPct: z.number().int().min(10).max(20).nullable(),
+  code: z.string().nullable(),
+  /** ISO-ish epoch ms when the active promo expires (ePaper → welcome). */
+  expiresAt: z.number().int().nonnegative().nullable(),
+  updatedAt: z.number().int().nonnegative(),
+});
+
+export type OfferState = z.infer<typeof OfferStateSchema>;
+
+export const DEFAULT_OFFER_STATE: OfferState = {
+  phase: "idle",
+  discountPct: null,
+  code: null,
+  expiresAt: null,
+  updatedAt: 0,
+};
+
+/** Packed QR matrix for mono ePaper (row-major bits, MSB first, 1 = black). */
+export const QrMatrixSchema = z.object({
+  size: z.number().int().positive(),
+  /** Base64 of ceil(size*size/8) bytes. */
+  modulesB64: z.string().min(1),
+});
+
+export type QrMatrix = z.infer<typeof QrMatrixSchema>;
+
+export const EpaperCommandSchema = z.discriminatedUnion("mode", [
+  z.object({
+    type: z.literal("epaper"),
+    mode: z.literal("welcome"),
+    updatedAt: z.number().int().nonnegative(),
+  }),
+  z.object({
+    type: z.literal("epaper"),
+    mode: z.literal("promo"),
+    code: z.string().min(1),
+    discountPct: z.number().int().min(10).max(20),
+    expiresAt: z.number().int().nonnegative(),
+    qr: QrMatrixSchema,
+    updatedAt: z.number().int().nonnegative(),
+  }),
+]);
+
+export type EpaperCommand = z.infer<typeof EpaperCommandSchema>;
