@@ -1,11 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import QRCode from "qrcode";
 import {
   DEFAULT_PANEL_STATE,
   PLACEHOLDER_MENU,
+  type DetectionBox,
   type PanelState,
 } from "@repo/shared";
+
+const OFFER_PRESENT_MS = 5000;
+
+type OfferPhase = "idle" | "prompt" | "qr" | "dismissed";
 
 function formatConfidence(value: number): string {
   return `${Math.round(value * 100)}%`;
@@ -19,76 +25,212 @@ function formatAge(updatedAt: number, now: number): string {
   return `${Math.floor(sec / 60)}m ago`;
 }
 
+type BoxRect = { x: number; y: number; w: number; h: number };
+
+function toRect(box: DetectionBox): BoxRect {
+  return { x: box.x, y: box.y, w: box.w, h: box.h };
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function lerpRect(from: BoxRect, to: BoxRect, t: number): BoxRect {
+  return {
+    x: lerp(from.x, to.x, t),
+    y: lerp(from.y, to.y, t),
+    w: lerp(from.w, to.w, t),
+    h: lerp(from.h, to.h, t),
+  };
+}
+
+function wsUrl(): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const host = window.location.hostname || "127.0.0.1";
+  const port = process.env.NEXT_PUBLIC_VISION_WS_PORT || "3001";
+  return `${proto}//${host}:${port}/`;
+}
+
+function pickDiscountPct(): number {
+  return 10 + Math.floor(Math.random() * 11);
+}
+
 export function VisionPanel() {
   const [state, setState] = useState<PanelState>(DEFAULT_PANEL_STATE);
   const [now, setNow] = useState(() => Date.now());
   const [connected, setConnected] = useState(false);
+  const [displayBox, setDisplayBox] = useState<BoxRect | null>(null);
+  const [imageSrc, setImageSrc] = useState<string | null>(null);
+
+  const [offerPhase, setOfferPhase] = useState<OfferPhase>("idle");
+  const [presentSince, setPresentSince] = useState<number | null>(null);
+  const [discountPct, setDiscountPct] = useState<number | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+
+  const targetBoxRef = useRef<BoxRect | null>(null);
+  const displayBoxRef = useRef<BoxRect | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
+  const offerPhaseRef = useRef<OfferPhase>("idle");
 
   useEffect(() => {
-    let source: EventSource | null = null;
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
-    let cancelled = false;
+    offerPhaseRef.current = offerPhase;
+  }, [offerPhase]);
 
-    const hydrate = async () => {
-      try {
-        const res = await fetch("/api/state", { cache: "no-store" });
-        if (!res.ok) return;
-        const data = (await res.json()) as PanelState;
-        if (!cancelled) setState(data);
-      } catch {
-        // ignore; SSE / poll will retry
+  useEffect(() => {
+    let cancelled = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+
+    const applyState = (data: PanelState) => {
+      setState(data);
+      if (data.primaryBox) {
+        targetBoxRef.current = toRect(data.primaryBox);
+        if (!displayBoxRef.current) {
+          displayBoxRef.current = toRect(data.primaryBox);
+          setDisplayBox(displayBoxRef.current);
+        }
+      } else {
+        targetBoxRef.current = null;
+        displayBoxRef.current = null;
+        setDisplayBox(null);
       }
     };
 
-    const startPoll = () => {
-      if (pollTimer) return;
-      pollTimer = setInterval(() => {
-        void hydrate();
-      }, 1500);
+    const setFrame = (buffer: ArrayBuffer) => {
+      const blob = new Blob([buffer], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+      objectUrlRef.current = url;
+      setImageSrc(url);
     };
 
-    void hydrate();
+    const connect = () => {
+      if (cancelled) return;
+      const url = wsUrl();
+      socket = new WebSocket(url);
+      socket.binaryType = "arraybuffer";
 
-    try {
-      source = new EventSource("/api/events");
-      source.onopen = () => {
-        if (!cancelled) setConnected(true);
+      socket.onopen = () => {
+        if (cancelled) return;
+        attempt = 0;
+        setConnected(true);
+        socket?.send(JSON.stringify({ type: "hello", role: "browser" }));
       };
-      source.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data) as PanelState;
-          if (!cancelled) {
-            setState(data);
-            setConnected(true);
+
+      socket.onmessage = (event) => {
+        if (cancelled) return;
+        if (typeof event.data === "string") {
+          try {
+            const msg = JSON.parse(event.data) as {
+              type?: string;
+              state?: PanelState;
+            };
+            if (msg.type === "state" && msg.state) {
+              applyState(msg.state);
+            }
+          } catch {
+            // ignore
           }
-        } catch {
-          // ignore malformed frames
+          return;
+        }
+        if (event.data instanceof ArrayBuffer) {
+          setFrame(event.data);
         }
       };
-      source.onerror = () => {
-        if (!cancelled) setConnected(false);
-        source?.close();
-        startPoll();
-      };
-    } catch {
-      startPoll();
-    }
 
+      socket.onclose = () => {
+        if (cancelled) return;
+        setConnected(false);
+        const delay = Math.min(4000, 500 * 2 ** attempt);
+        attempt += 1;
+        reconnectTimer = setTimeout(connect, delay);
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
+    };
+
+    connect();
     const clock = setInterval(() => setNow(Date.now()), 1000);
 
     return () => {
       cancelled = true;
-      source?.close();
-      if (pollTimer) clearInterval(pollTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       clearInterval(clock);
+      socket?.close();
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
     };
   }, []);
 
-  const imageSrc = state.imageBase64
-    ? state.imageBase64.startsWith("data:")
-      ? state.imageBase64
-      : `data:image/jpeg;base64,${state.imageBase64}`
-    : null;
+  useEffect(() => {
+    let frame = 0;
+    const tick = () => {
+      const target = targetBoxRef.current;
+      const current = displayBoxRef.current;
+      if (target && current) {
+        const next = lerpRect(current, target, 0.35);
+        displayBoxRef.current = next;
+        setDisplayBox(next);
+      } else if (target && !current) {
+        displayBoxRef.current = target;
+        setDisplayBox(target);
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  // Track continuous face presence for the guest offer.
+  useEffect(() => {
+    if (state.humanPresent) {
+      setPresentSince((prev) => prev ?? Date.now());
+      return;
+    }
+    setPresentSince(null);
+    setOfferPhase("idle");
+    setDiscountPct(null);
+    setQrDataUrl(null);
+  }, [state.humanPresent]);
+
+  useEffect(() => {
+    if (!state.humanPresent || presentSince === null) return;
+    if (offerPhaseRef.current !== "idle") return;
+    if (now - presentSince < OFFER_PRESENT_MS) return;
+    setOfferPhase("prompt");
+  }, [state.humanPresent, presentSince, now]);
+
+  const acceptOffer = async () => {
+    const pct = pickDiscountPct();
+    const code = `VISION-${pct}OFF`;
+    try {
+      const url = await QRCode.toDataURL(code, {
+        width: 220,
+        margin: 2,
+        color: { dark: "#10241e", light: "#ffffff" },
+      });
+      setDiscountPct(pct);
+      setQrDataUrl(url);
+      setOfferPhase("qr");
+    } catch {
+      setDiscountPct(pct);
+      setQrDataUrl(null);
+      setOfferPhase("qr");
+    }
+  };
+
+  const dismissOffer = () => {
+    setOfferPhase("dismissed");
+    setDiscountPct(null);
+    setQrDataUrl(null);
+  };
 
   return (
     <div className="relative z-10 mx-auto flex min-h-screen w-full max-w-6xl flex-col gap-10 px-5 py-10 sm:px-8 lg:px-10">
@@ -106,8 +248,8 @@ export function VisionPanel() {
           Vision Menu
         </h1>
         <p className="max-w-xl text-base sm:text-lg" style={{ color: "var(--ink-soft)" }}>
-          Stand still in frame to unlock today&apos;s menu. Live presence and stillness
-          are computed from the camera stream.
+          Today&apos;s menu is always on. Linger in frame for a few seconds and we may
+          offer a guest discount.
         </p>
         <div className="flex items-center gap-3 text-sm" style={{ color: "var(--ink-soft)" }}>
           <span
@@ -115,7 +257,7 @@ export function VisionPanel() {
             style={{ background: connected ? "var(--accent-bright)" : "var(--locked)" }}
             aria-hidden
           />
-          {connected ? "Live" : "Reconnecting"}
+          {connected ? "Live WS" : "Reconnecting"}
           <span aria-hidden>·</span>
           <span>Updated {formatAge(state.updatedAt, now)}</span>
           {state.deviceId ? (
@@ -127,74 +269,12 @@ export function VisionPanel() {
         </div>
       </header>
 
-      <section
-        className="animate-fade-up grid gap-8 lg:grid-cols-[1.1fr_0.9fr]"
+      <div
+        className="animate-fade-up grid gap-10 lg:grid-cols-2 lg:items-start"
         style={{ animationDelay: "80ms" }}
-        aria-label="Camera status"
       >
-        <div className="overflow-hidden rounded-sm" style={{ background: "var(--bg-deep)" }}>
-          <div className="relative aspect-[4/3] w-full">
-            {imageSrc ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={imageSrc}
-                alt="Latest frame from Vision AI Camera"
-                className="h-full w-full object-cover"
-              />
-            ) : (
-              <div
-                className="flex h-full w-full items-center justify-center px-8 text-center text-sm"
-                style={{ color: "rgba(231, 243, 238, 0.7)" }}
-              >
-                Waiting for the first frame from the camera…
-              </div>
-            )}
-            {state.primaryBox && state.width > 0 && state.height > 0 ? (
-              <div
-                className="pointer-events-none absolute border-2"
-                style={{
-                  borderColor: state.isStill ? "var(--accent-bright)" : "rgba(255,255,255,0.85)",
-                  left: `${(state.primaryBox.x / state.width) * 100}%`,
-                  top: `${(state.primaryBox.y / state.height) * 100}%`,
-                  width: `${(state.primaryBox.w / state.width) * 100}%`,
-                  height: `${(state.primaryBox.h / state.height) * 100}%`,
-                }}
-              />
-            ) : null}
-          </div>
-        </div>
-
-        <div className="flex flex-col justify-center gap-6">
-          <StatusRow
-            label="Human in frame"
-            value={state.humanPresent ? "Detected" : "None"}
-            active={state.humanPresent}
-          />
-          <StatusRow
-            label="Standing still"
-            value={state.isStill ? `Yes · ${Math.round(state.stillMs / 100) / 10}s` : "No"}
-            active={state.isStill}
-          />
-          <StatusRow
-            label="Confidence"
-            value={state.humanPresent ? formatConfidence(state.confidence) : "—"}
-            active={state.confidence >= 0.5}
-          />
-          <StatusRow
-            label="Menu"
-            value={state.menuUnlocked ? "Unlocked" : "Locked — stand still"}
-            active={state.menuUnlocked}
-          />
-        </div>
-      </section>
-
-      <section
-        className="animate-fade-up"
-        style={{ animationDelay: "160ms" }}
-        aria-label="Digital menu"
-      >
-        <div className="mb-5 flex items-end justify-between gap-4">
-          <div>
+        <section aria-label="Digital menu">
+          <div className="mb-5">
             <h2
               className="text-3xl tracking-tight sm:text-4xl"
               style={{ fontFamily: "var(--font-display)" }}
@@ -202,36 +282,22 @@ export function VisionPanel() {
               Today&apos;s Menu
             </h2>
             <p className="mt-1 text-sm" style={{ color: "var(--ink-soft)" }}>
-              {state.menuUnlocked
-                ? "Unlocked by stillness — browse and order at the counter."
-                : "Hold still in the camera frame to reveal the menu."}
+              Browse and order at the counter.
             </p>
           </div>
-        </div>
 
-        {!state.menuUnlocked ? (
-          <div
-            className="flex min-h-48 items-center justify-center border border-dashed px-6 py-10 text-center"
-            style={{ borderColor: "var(--line)", color: "var(--locked)" }}
-          >
-            Menu locked until a person stands still in frame.
-          </div>
-        ) : (
-          <ul className="grid gap-6 sm:grid-cols-2">
+          <ul className="grid gap-6">
             {PLACEHOLDER_MENU.map((item, index) => (
               <li
                 key={item.id}
-                className="animate-unlock border-t pt-4"
+                className="animate-fade-up border-t pt-4"
                 style={{
                   borderColor: "var(--line)",
                   animationDelay: `${index * 70}ms`,
                 }}
               >
                 <div className="flex items-baseline justify-between gap-3">
-                  <h3
-                    className="text-xl"
-                    style={{ fontFamily: "var(--font-display)" }}
-                  >
+                  <h3 className="text-xl" style={{ fontFamily: "var(--font-display)" }}>
                     {item.name}
                   </h3>
                   <span className="font-medium" style={{ color: "var(--accent)" }}>
@@ -244,8 +310,171 @@ export function VisionPanel() {
               </li>
             ))}
           </ul>
-        )}
-      </section>
+        </section>
+
+        <section className="flex flex-col gap-8" aria-label="Camera status">
+          <div className="overflow-hidden rounded-sm" style={{ background: "var(--bg-deep)" }}>
+            <div className="relative aspect-square w-full">
+              {imageSrc ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={imageSrc}
+                  alt="Live WebSocket JPEG stream"
+                  className="h-full w-full object-contain"
+                />
+              ) : (
+                <div
+                  className="flex h-full w-full items-center justify-center px-8 text-center text-sm"
+                  style={{ color: "rgba(231, 243, 238, 0.7)" }}
+                >
+                  Waiting for WebSocket frames from the camera…
+                </div>
+              )}
+              {displayBox && state.width > 0 && state.height > 0 ? (
+                <div
+                  className="pointer-events-none absolute border-2 will-change-[left,top,width,height]"
+                  style={{
+                    borderColor: state.isStill ? "var(--accent-bright)" : "rgba(255,255,255,0.85)",
+                    left: `${(displayBox.x / state.width) * 100}%`,
+                    top: `${(displayBox.y / state.height) * 100}%`,
+                    width: `${(displayBox.w / state.width) * 100}%`,
+                    height: `${(displayBox.h / state.height) * 100}%`,
+                  }}
+                />
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-6">
+            <StatusRow
+              label="Human in frame"
+              value={state.humanPresent ? "Detected" : "None"}
+              active={state.humanPresent}
+            />
+            <StatusRow
+              label="Standing still"
+              value={
+                !state.humanPresent
+                  ? "No"
+                  : state.isStill
+                    ? `Yes · ${(state.stillMs / 1000).toFixed(1)}s`
+                    : "Settling…"
+              }
+              active={state.isStill}
+            />
+            <StatusRow
+              label="Confidence"
+              value={state.humanPresent ? formatConfidence(state.confidence) : "—"}
+              active={state.confidence >= 0.5}
+            />
+          </div>
+        </section>
+      </div>
+
+      {offerPhase === "prompt" ? (
+        <div
+          className="animate-fade-up fixed inset-x-0 top-0 z-50 px-4 pt-4 sm:px-6"
+          role="status"
+          aria-live="polite"
+        >
+          <div
+            className="mx-auto flex max-w-3xl flex-col gap-4 border px-5 py-4 shadow-lg sm:flex-row sm:items-center sm:justify-between"
+            style={{
+              background: "var(--surface)",
+              borderColor: "var(--line)",
+              backdropFilter: "blur(10px)",
+            }}
+          >
+            <div>
+              <p
+                className="text-lg tracking-tight"
+                style={{ fontFamily: "var(--font-display)", color: "var(--ink)" }}
+              >
+                Guest offer ready
+              </p>
+              <p className="mt-0.5 text-sm" style={{ color: "var(--ink-soft)" }}>
+                You&apos;ve been here a moment — claim a 10–20% off code?
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={() => void acceptOffer()}
+                className="px-5 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                style={{ background: "var(--accent)" }}
+              >
+                Show my offer
+              </button>
+              <button
+                type="button"
+                onClick={dismissOffer}
+                className="px-5 py-2.5 text-sm font-medium transition-opacity hover:opacity-80"
+                style={{ color: "var(--ink-soft)", border: "1px solid var(--line)" }}
+              >
+                No thanks
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {offerPhase === "qr" && discountPct !== null ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center px-5"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="offer-qr-title"
+        >
+          <button
+            type="button"
+            className="absolute inset-0 cursor-default border-0"
+            style={{ background: "rgba(12, 31, 26, 0.55)" }}
+            aria-label="Close offer"
+            onClick={dismissOffer}
+          />
+          <div
+            className="animate-unlock relative z-10 w-full max-w-sm border px-6 py-8 text-center shadow-xl"
+            style={{
+              background: "#f7fcf9",
+              borderColor: "var(--line)",
+            }}
+          >
+            <p
+              id="offer-qr-title"
+              className="text-3xl tracking-tight"
+              style={{ fontFamily: "var(--font-display)", color: "var(--accent)" }}
+            >
+              {discountPct}% off
+            </p>
+            <p className="mt-2 text-sm" style={{ color: "var(--ink-soft)" }}>
+              Scan at the counter — code{" "}
+              <span className="font-mono font-medium" style={{ color: "var(--ink)" }}>
+                VISION-{discountPct}OFF
+              </span>
+            </p>
+            {qrDataUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={qrDataUrl}
+                alt={`QR code for VISION-${discountPct}OFF`}
+                className="mx-auto mt-6 h-52 w-52 bg-white p-2"
+              />
+            ) : (
+              <p className="mt-6 text-sm" style={{ color: "var(--locked)" }}>
+                QR unavailable — use the code above.
+              </p>
+            )}
+            <button
+              type="button"
+              onClick={dismissOffer}
+              className="mt-6 px-5 py-2.5 text-sm font-medium transition-opacity hover:opacity-80"
+              style={{ color: "var(--ink-soft)", border: "1px solid var(--line)" }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

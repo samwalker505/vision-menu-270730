@@ -21,6 +21,8 @@ export async function POST(request: Request) {
     );
   }
 
-  const state = getVisionStore().ingest(parsed.data);
-  return NextResponse.json({ ok: true, state });
+  getVisionStore().ingest(parsed.data);
+  // Keep the response tiny — firmware streams at high cadence and must not
+  // download the last JPEG back on every POST.
+  return NextResponse.json({ ok: true });
 }

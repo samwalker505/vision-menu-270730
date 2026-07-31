@@ -13,7 +13,10 @@ export async function GET() {
   const stream = new ReadableStream({
     start(controller) {
       const send = (data: unknown) => {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        // Always strip imageBase64 — video comes from /api/mjpeg now.
+        const state = data as { imageBase64?: string | null };
+        const payload = { ...state, imageBase64: null };
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
       };
 
       send(store.getState());
@@ -21,7 +24,6 @@ export async function GET() {
 
       heartbeat = setInterval(() => {
         controller.enqueue(encoder.encode(`: heartbeat\n\n`));
-        // Refresh stale evaluation for clients even without new ingest.
         send(store.getState());
       }, 2000);
     },

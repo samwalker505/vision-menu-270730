@@ -66,7 +66,7 @@ export const DEFAULT_PANEL_STATE: PanelState = {
   lastIngestAt: 0,
 };
 
-/** Placeholder menu shown once a still human unlocks the panel. */
+/** Placeholder menu always shown on the vision panel. */
 export const PLACEHOLDER_MENU = [
   {
     id: "espresso",

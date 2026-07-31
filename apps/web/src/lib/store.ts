@@ -5,7 +5,10 @@ type Listener = (state: PanelState) => void;
 
 declare global {
   var __visionMenuStore: VisionStore | undefined;
+  var __visionMenuStoreVersion: number | undefined;
 }
+
+const STORE_VERSION = 5;
 
 class VisionStore {
   readonly engine = new StillnessEngine();
@@ -36,8 +39,12 @@ class VisionStore {
 }
 
 export function getVisionStore(): VisionStore {
-  if (!globalThis.__visionMenuStore) {
+  if (
+    !globalThis.__visionMenuStore ||
+    globalThis.__visionMenuStoreVersion !== STORE_VERSION
+  ) {
     globalThis.__visionMenuStore = new VisionStore();
+    globalThis.__visionMenuStoreVersion = STORE_VERSION;
   }
   return globalThis.__visionMenuStore;
 }

@@ -1,0 +1,6 @@
+{
+  "clangd.arguments": [
+    "--compile-commands-dir=/Users/samwalker/Projects/vision-menu-270730/firmware/xiao-vision/.cache/clangd",
+    "--query-driver=/Users/samwalker/.platformio/packages/toolchain-*/bin/*,/Users/samwalker/.platformio/packages/tool-*/bin/*"
+  ]
+}
